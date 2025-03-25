@@ -16,29 +16,16 @@ extern "C"
 LoRa_GW lora_gateway;
 static RadioEvents_t RadioEvents;
 
+const char *PubTopic  = "sensor_data/sensors";               // Topic to publish
+
+AsyncMqttClient mqttClient;
 TimerHandle_t mqttReconnectTimer;
 TimerHandle_t wifiReconnectTimer;
-AsyncMqttClient mqttClient;
-const char *PubTopic  = "sensor_data/sensors";               // Topic to 
-
-
-void wifiEvent(WiFiEvent_t event);
-
-void connectToWifi();
-void connectToMqtt();
-void onMqttConnect(bool sessionPresent);
-void onMqttDisconnect(AsyncMqttClientDisconnectReason reason);
-void onMqttSubscribe(const uint16_t& packetId, const uint8_t& qos);
-void onMqttUnsubscribe(const uint16_t& packetId);
-void onMqttMessage(char* topic, char* payload, const AsyncMqttClientMessageProperties& properties, size_t len, size_t index, size_t total);
-
-void onMqttPublish(const uint16_t& packetId);
 
 void setup() {
 
-    Serial.begin(115200);
     Mcu.begin(HELTEC_BOARD,SLOW_CLK_TPYE);
-
+    Serial.begin(115200);
 
     while (!Serial && millis() < 5000);
 
@@ -48,8 +35,12 @@ void setup() {
     Serial.println(ARDUINO_BOARD);
     Serial.println(ASYNC_MQTT_ESP32_VERSION);
 
+    mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0,
+                                      reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
+    wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0,
+                                      reinterpret_cast<TimerCallbackFunction_t>(connectToWifi));
 
-    WiFi.onEvent(wifiEvent);
+    WiFi.onEvent(WiFiEvent);
 
     mqttClient.onConnect(onMqttConnect);
     mqttClient.onDisconnect(onMqttDisconnect);
@@ -61,11 +52,10 @@ void setup() {
     mqttClient.setServer(MQTT_HOST, MQTT_PORT);
 
     connectToWifi();
-    
 
-    mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0,reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
-
-    wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0,reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
+    Serial.print("\nStarting FullyFeature_ESP32 on ");
+    Serial.println(ARDUINO_BOARD);
+    Serial.println(ASYNC_MQTT_ESP32_VERSION);
 
       // Set callback to a lambda function that binds the `this` pointer
     RadioEvents.RxDone = OnRxDone;
@@ -75,12 +65,15 @@ void setup() {
                               LORA_CODINGRATE, 0, LORA_PREAMBLE_LENGTH,
                               LORA_SYMBOL_TIMEOUT, LORA_FIX_LENGTH_PAYLOAD_ON,
                               0, true, 0, 0, LORA_IQ_INVERSION_ON, true );
+                              
 }
 
 
 void loop()
 {
   
+  static uint32_t count = 0;
+  count ++;
   static unsigned long lastMsg = 0;
   if (millis() - lastMsg > 5000) {
     lastMsg = millis();
@@ -110,53 +103,121 @@ void OnRxDone( uint8_t *payload, uint16_t size, int16_t rx_rssi, int8_t rx_snr )
   lora_gateway.set_lora_idle();
 }
 
-
-void wifiEvent(WiFiEvent_t event) {
-  switch (event) {
-#if USING_CORE_ESP32_CORE_V200_PLUS
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP6:
-#else
-    case SYSTEM_EVENT_STA_GOT_IP:
-#endif
-      Serial.printf("WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
-      connectToMqtt();
-      break;
-
-#if USING_CORE_ESP32_CORE_V200_PLUS
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-#else
-    case SYSTEM_EVENT_STA_DISCONNECTED:
-#endif
-      Serial.println("WiFi lost connection.");
-      xTimerStop(mqttReconnectTimer, 0);
-      xTimerStart(wifiReconnectTimer, 0);
-      break;
-
-    default: break;
-  }
-}
-
-void connectToWifi() {
+void connectToWifi()
+{
   Serial.println("Connecting to Wi-Fi...");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
-void connectToMqtt() {
+void connectToMqtt()
+{
   Serial.println("Connecting to MQTT...");
   mqttClient.connect();
 }
 
-void onMqttConnect(bool sessionPresent) {
-  Serial.printf("Connected to MQTT broker at %s:%d\n", MQTT_HOST, MQTT_PORT);
-  Serial.printf("Publishing to topic: %s\n", PubTopic);
+void WiFiEvent(WiFiEvent_t event)
+{
+  switch (event)
+  {
+#if USING_CORE_ESP32_CORE_V200_PLUS
+
+    case ARDUINO_EVENT_WIFI_READY:
+      Serial.println("WiFi ready");
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_START:
+      Serial.println("WiFi STA starting");
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("WiFi STA connected");
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP6:
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.println("WiFi connected");
+      Serial.print("IP address: ");
+      Serial.println(WiFi.localIP());
+      connectToMqtt();
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+      Serial.println("WiFi lost IP");
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.println("WiFi lost connection");
+      xTimerStop(mqttReconnectTimer, 0); // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
+      xTimerStart(wifiReconnectTimer, 0);
+      break;
+#else
+
+    case SYSTEM_EVENT_STA_GOT_IP:
+      Serial.println("WiFi connected");
+      Serial.println("IP address: ");
+      Serial.println(WiFi.localIP());
+      connectToMqtt();
+      break;
+
+    case SYSTEM_EVENT_STA_DISCONNECTED:
+      Serial.println("WiFi lost connection");
+      xTimerStop(mqttReconnectTimer, 0); // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
+      xTimerStart(wifiReconnectTimer, 0);
+      break;
+#endif
+
+    default:
+      break;
+  }
 }
 
-void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+void printSeparationLine()
+{
+  Serial.println("************************************************");
+}
+
+void onMqttConnect(bool sessionPresent)
+{
+  Serial.print("Connected to MQTT broker: ");
+  Serial.print(MQTT_HOST);
+  Serial.print(", port: ");
+  Serial.println(MQTT_PORT);
+  Serial.print("PubTopic: ");
+  Serial.println(PubTopic);
+
+  printSeparationLine();
+  Serial.print("Session present: ");
+  Serial.println(sessionPresent);
+
+  uint16_t packetIdSub = mqttClient.subscribe(PubTopic, 2);
+  Serial.print("Subscribing at QoS 2, packetId: ");
+  Serial.println(packetIdSub);
+
+  mqttClient.publish(PubTopic, 0, true, "ESP32 Test");
+  Serial.println("Publishing at QoS 0");
+
+  uint16_t packetIdPub1 = mqttClient.publish(PubTopic, 1, true, "test 2");
+  Serial.print("Publishing at QoS 1, packetId: ");
+  Serial.println(packetIdPub1);
+
+  uint16_t packetIdPub2 = mqttClient.publish(PubTopic, 2, true, "test 3");
+  Serial.print("Publishing at QoS 2, packetId: ");
+  Serial.println(packetIdPub2);
+
+  printSeparationLine();
+}
+
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason)
+{
+  (void) reason;
+
   Serial.println("Disconnected from MQTT.");
-  if (WiFi.isConnected()) xTimerStart(mqttReconnectTimer, 0);
-}
 
+  if (WiFi.isConnected())
+  {
+    xTimerStart(mqttReconnectTimer, 0);
+  }
+}
 
 void onMqttSubscribe(const uint16_t& packetId, const uint8_t& qos)
 {
@@ -174,11 +235,33 @@ void onMqttUnsubscribe(const uint16_t& packetId)
   Serial.println(packetId);
 }
 
-void onMqttMessage(char* topic, char* payload, const AsyncMqttClientMessageProperties& properties, size_t len, size_t index, size_t total) {
-  Serial.printf("MQTT Message | Topic: %s | QoS: %d | Retain: %d | Len: %d/%d\n", 
-                topic, properties.qos, properties.retain, index, total);
+void onMqttMessage(char* topic, char* payload, const AsyncMqttClientMessageProperties& properties,
+                   const size_t& len, const size_t& index, const size_t& total)
+{
+  (void) payload;
+
+  Serial.println("Publish received.");
+  Serial.print("  topic: ");
+  Serial.println(topic);
+  Serial.print("  qos: ");
+  Serial.println(properties.qos);
+  Serial.print("  dup: ");
+  Serial.println(properties.dup);
+  Serial.print("  retain: ");
+  Serial.println(properties.retain);
+  Serial.print("  len: ");
+  Serial.println(len);
+  Serial.print("  index: ");
+  Serial.println(index);
+  Serial.print("  total: ");
+  Serial.println(total);
 }
 
-void onMqttPublish(const uint16_t& packetId) {
-  Serial.printf("Publish acknowledged. Packet ID: %d\n", packetId);
+void onMqttPublish(const uint16_t& packetId)
+{
+  Serial.println("Publish acknowledged.");
+  Serial.print("  packetId: ");
+  Serial.println(packetId);
 }
+
+

@@ -1,8 +1,4 @@
-#ifndef ASYNC_MQTT_ESP32_IMPL_H
-#define ASYNC_MQTT_ESP32_IMPL_H
-#include <AsyncMQTT_ESP32.h>
-// Code
-#endif
+
 #include <WiFi.h>
 #include <array>
 #include "remote_station.hpp"
