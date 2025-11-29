@@ -12,9 +12,36 @@ extern "C"
 #include "freertos/timers.h"
 }
 #include <AsyncMQTT_ESP32.h>
+#include "lora_sx1262.hpp"
+#include <SPI.h>
+#include "Adafruit_CCS811.h"
 
-LoRa_GW lora_gateway;
-static RadioEvents_t RadioEvents;
+#define RX_TIMEOUT_VALUE                            1000
+#define BUFFER_SIZE                                 30 // Define the payload size here
+
+#define LED_PIN 35
+#define CJMCU_CO2_ADDR 0x5A   //When addr line is low 0x5B when High
+
+#define SDA_PIN 6
+#define SCL_PIN 7
+#define IS_MASTER 1
+#define DIO1 14
+
+Adafruit_CCS811 ccs;
+// Use VSPI with custom pins (Heltec V3)
+SPIClass spiLoRa(1); // 1 = HSPI, 2 = VSPI (but macro may not be defined)
+
+JtSX1262 radio(
+  8,   // NSS
+  12,  // RST
+  13,  // BUSY
+  14,  // DIO1
+  spiLoRa
+);
+
+char txpacket[BUFFER_SIZE];
+char rxpacket[BUFFER_SIZE];
+
 
 const char *PubTopic  = "sensor_data/sensors";               // Topic to publish
 
@@ -23,85 +50,161 @@ TimerHandle_t mqttReconnectTimer;
 TimerHandle_t wifiReconnectTimer;
 
 void setup() {
-
-    Mcu.begin(HELTEC_BOARD,SLOW_CLK_TPYE);
     Serial.begin(115200);
 
     while (!Serial && millis() < 5000);
 
+#if IS_MASTER
+    Wire.begin(SDA_PIN, SCL_PIN);
+#endif
+    pinMode(LED_PIN,OUTPUT);
+    digitalWrite(LED_PIN,LOW);
     delay(500);
 
-    Serial.print("\nStarting FullyFeature_ESP32 on ");
+    Serial.print("\nStarting MQTT FullyFeature_ESP32 on ");
     Serial.println(ARDUINO_BOARD);
     Serial.println(ASYNC_MQTT_ESP32_VERSION);
 
-    mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0,
-                                      reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
-    wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0,
-                                      reinterpret_cast<TimerCallbackFunction_t>(connectToWifi));
+    // Use custom SPI pins
+    spiLoRa.begin(9, 11, 10, 8); // SCK, MISO, MOSI, NSS
+    radio.begin();
+    delay(50);
+    // Set frequency to 868 MHz
+    radio.setFrequency(868000000);  // Set RF frequency to 868 MHz
+    // Set modulation parameters (e.g., SF7, 125 kHz, 4/5 coding rate)
+    radio.setModulationParams(7, 0x70, 0x01);  // Spreading factor 7, 125 kHz, 4/5 coding rate
+    // Set TX power to 14 dBm
+    radio.setTxPower(14);  // Transmission power in dBm
 
-    WiFi.onEvent(WiFiEvent);
+    // Set the mode to LoRa (standby first, then RX)
+    uint8_t standbyMode = 0x00;  // Standby mode
+    radio.writeCommand(0x80, &standbyMode, 1);  // Set to standby
+    delay(50);  // Wait for mode change
 
-    mqttClient.onConnect(onMqttConnect);
-    mqttClient.onDisconnect(onMqttDisconnect);
-    mqttClient.onSubscribe(onMqttSubscribe);
-    mqttClient.onUnsubscribe(onMqttUnsubscribe);
-    mqttClient.onMessage(onMqttMessage);
-    mqttClient.onPublish(onMqttPublish);
+    uint8_t rxMode = 0x03;  // LoRa RX mode
+    radio.writeCommand(0x82, &rxMode, 1);  // Switch to RX mode
 
-    mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+    // Enable interrupts for RX_DONE
+    uint8_t irq_mask[] = {0x00, 0x20};  // RX_DONE interrupt enabled
+    radio.writeCommand(0x11, irq_mask, 2);  // Set IRQ mask
+    pinMode(DIO1, INPUT);  // DIO1 as input
+    attachInterrupt(digitalPinToInterrupt(DIO1), irqHandler, FALLING);  // Trigger interrupt on falling edge
 
-    connectToWifi();
+    delay(500);
+    // Debug mode
+    uint8_t opMode = 0;
+    radio.readCommand(0x01, &opMode, 1);  // Read OpMode register
+    Serial.print("Current OpMode: 0x");
+    Serial.println(opMode, HEX);
 
-    Serial.print("\nStarting FullyFeature_ESP32 on ");
-    Serial.println(ARDUINO_BOARD);
-    Serial.println(ASYNC_MQTT_ESP32_VERSION);
+#if IS_MASTER
+    if (!ccs.begin()) {
+        Serial.println("Failed to start CCS811 sensor! Check wiring.");
+        while (1);
+    }
 
-      // Set callback to a lambda function that binds the `this` pointer
-    RadioEvents.RxDone = OnRxDone;
-    Radio.Init( &RadioEvents );
-    Radio.SetChannel( RF_FREQUENCY );
-    Radio.SetRxConfig( MODEM_LORA, LORA_BANDWIDTH, LORA_SPREADING_FACTOR,
-                              LORA_CODINGRATE, 0, LORA_PREAMBLE_LENGTH,
-                              LORA_SYMBOL_TIMEOUT, LORA_FIX_LENGTH_PAYLOAD_ON,
-                              0, true, 0, 0, LORA_IQ_INVERSION_ON, true );
+    Serial.println("CCS811 sensor initialized.");
+#endif
+    // uint8_t msg[] = "Hello!";
+    // radio.transmit(msg, sizeof(msg));
+    // mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0,
+    //                                   reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
+    // wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0,
+    //                                   reinterpret_cast<TimerCallbackFunction_t>(connectToWifi));
+
+    // WiFi.onEvent(WiFiEvent);
+
+    // mqttClient.onConnect(onMqttConnect);
+    // mqttClient.onDisconnect(onMqttDisconnect);
+    // mqttClient.onSubscribe(onMqttSubscribe);
+    // mqttClient.onUnsubscribe(onMqttUnsubscribe);
+    // mqttClient.onMessage(onMqttMessage);
+    // mqttClient.onPublish(onMqttPublish);
+
+    // mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+
+    // connectToWifi();
+
+    // Serial.print("\nStarting FullyFeature_ESP32 on ");
+    // Serial.println(ARDUINO_BOARD);
+    // Serial.println(ASYNC_MQTT_ESP32_VERSION);
+
                               
 }
-
 
 void loop()
 {
   
-  static uint32_t count = 0;
-  count ++;
-  static unsigned long lastMsg = 0;
-  if (millis() - lastMsg > 5000) {
-    lastMsg = millis();
-    uint16_t packetIdPub2 = mqttClient.publish(PubTopic, 2, true, "test 3");
-    Serial.print("Publishing at QoS 2, packetId: ");
-    Serial.println(packetIdPub2);
-  }
+  // static uint32_t count = 0;
+  // count ++;
+  // static unsigned long lastMsg = 0;
+  // if (millis() - lastMsg > 5000) {
+  //   lastMsg = millis();
+  //   uint16_t packetIdPub2 = mqttClient.publish(PubTopic, 2, true, "test 3");
+  //   Serial.print("Publishing at QoS 2, packetId: ");
+  //   Serial.println(packetIdPub2);
+  // }
 
-  if(lora_gateway.get_lora_idle())
-  {
-    lora_gateway.clear_lora_idle();
-    Serial.println("into RX mode");
-    Radio.Rx(0);
-  }
-  Radio.IrqProcess( );
 
+#if IS_MASTER
+  uint16_t co2_value = 0;
+  uint16_t tvoc_value = 0;
+  if (ccs.available()) {
+    if (!ccs.readData()) {
+        co2_value = ccs.geteCO2();
+        tvoc_value = ccs.getTVOC();
+    } else {
+      Serial.println("Error reading CCS811 sensor data.");
+    }
+  }
+  digitalWrite(LED_PIN,HIGH);
+      // build packet
+  sprintf(txpacket,"%u,%u",co2_value,tvoc_value); 
+  Serial.print("Sending: ");
+  Serial.println(txpacket);
+  radio.transmit((uint8_t*)txpacket, strlen(txpacket));
+  delay(1000); 
+  digitalWrite(LED_PIN,LOW);
+  delay(3000);  // Wait before next message
+#else
+  uint8_t buffer[255];
+  uint8_t length = 0;
+  delay(1000);
+
+  uint8_t status = radio.readStatus();
+  if ((status & 0x80) == 0x80) {  // Check if LoRa mode is enabled
+    Serial.println("LoRa mode active.");
+  } else {
+      Serial.println("LoRa mode not active.");
+  } 
+  Serial.print("SX1262 status: 0x");
+  Serial.println(status, HEX);
+  if (radio.receive(buffer, &length)) {
+    digitalWrite(LED_PIN,HIGH);
+    Serial.print("Received: ");
+    for (uint8_t i = 0; i < length; i++) {
+      Serial.write(buffer[i]);
+      Serial.print("Received buffer: ");
+    }
+    Serial.println();
+
+    Serial.println("Write to rx Mode: ");
+    // restart receive mode
+    uint8_t rx_params[] = { 0x00, 0x00, 0x00 };  
+    radio.writeCommand(0x82, rx_params, 3); // SetRx with no timeout
+    radio.readCommand(0x82, buffer,3); // SetRx with no timeout
+
+    for (uint8_t i = 0; i < length; i++) {
+      Serial.print(buffer[i]);
+      Serial.print("Received: ");
+    }
+    digitalWrite(LED_PIN,LOW);
+  }
+  Serial.println("Test");
+  delay(500);
+#endif
 }
 
-void OnRxDone( uint8_t *payload, uint16_t size, int16_t rx_rssi, int8_t rx_snr )
-{
-  lora_gateway.rssi=rx_rssi;
-  lora_gateway.rx_size=size;
-  memcpy(lora_gateway.rxpacket, payload, lora_gateway.rx_size );
-  lora_gateway.rxpacket[size]='\0';
-  Radio.Sleep();
-  Serial.printf("\r\nReceived packet \"%s\" with rssi %d , length %d\r\n",lora_gateway.rxpacket,lora_gateway.rssi, lora_gateway.rx_size);
-  lora_gateway.set_lora_idle();
-}
 
 void connectToWifi()
 {
@@ -264,4 +367,8 @@ void onMqttPublish(const uint16_t& packetId)
   Serial.println(packetId);
 }
 
+void irqHandler() {
+    // Handle the interrupt, check the received message or status
+    Serial.println("IRQ Triggered, packet received!");
+}
 

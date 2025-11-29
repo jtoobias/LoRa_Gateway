@@ -29,12 +29,10 @@
 #define BUFFER_SIZE                                 30 // Define the payload size here
 
 #define _ASYNC_MQTT_LOGLEVEL_               1
-#define WIFI_SSID         "Boomklever Boven"
-#define WIFI_PASSWORD     "ewbkshxd"
-#define MQTT_HOST         IPAddress(192, 168, 2, 235)
+#define WIFI_SSID         "Ziggo1459309"
+#define WIFI_PASSWORD     "dRez4aj2wcnf"
+#define MQTT_HOST         IPAddress(192, 168, 178, 181) //192.168.178.181
 #define MQTT_PORT         1883
-#define WIFI_SSID         "Boomklever Boven"
-#define WIFI_PASSWORD     "ewbkshxd"
 
 class LoRa_GW{
   public:
