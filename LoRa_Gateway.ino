@@ -4,26 +4,31 @@
 #include <Wire.h>
 #include "Adafruit_CCS811.h"
 #include "SparkFun_SCD4x_Arduino_Library.h" //Click here to get the library: http://librarymanager/All#SparkFun_SCD4x
-
+#include "gateway.hpp"
 
 // ==== CONFIG ====
-// #define MQTT_HOST       "192.168.1.10"   // your broker IP
-#define MQTT_PORT       1883
-#define WIFI_SSID         "Ziggo1459309"
-#define WIFI_PASSWORD     "dRez4aj2wcnf"
-#define MQTT_HOST         IPAddress(192, 168, 178, 127) //192.168.178.181
 // Heltec WiFi LoRa 32 V3 onboard LED pin
 #define LED_PIN 35
 #define UPDATE_PERIOD (1000*60*5)
+#define FW_MAJOR  0
+#define FW_MINOR  1
+#define FW_PATCH  0
+#define DEVICE_TYPE 0
 
-const char* MQTT_TOPIC = "sensor_data/sensor_data";
+#define MAX_BUFFER_SIZE 100
+
+String MQTT_DATA_TOPIC = "sensor_device/data";
+String MQTT_REGISTRATION_TOPIC = "sensor_device/registration";
+String MQTT_REGISTRATION_RESPONSE_TOPIC = "sensor_device/registration_response";
 
 // ==== GLOBALS ====
+char global_array[MAX_BUFFER_SIZE];
+
 AsyncMqttClient mqttClient;
 Adafruit_CCS811 ccs;
 SCD4x mySensor;
 
-uint64_t uuid;
+LoRa_GW sensor_gateway;
 
 TimerHandle_t mqttReconnectTimer;
 TimerHandle_t wifiReconnectTimer;
@@ -39,6 +44,7 @@ void setup_scd40(void){
     while (1)
       ;
   }
+
 
  //We need to stop periodic measurements before we can change the sensor signal compensation settings
   if (mySensor.stopPeriodicMeasurement() == true)
@@ -71,14 +77,6 @@ void setup_scd40(void){
   //The signal compensation settings are stored in RAM by default and will reset if reInit is called
   //or if the power is cycled. To store the settings in EEPROM we can call:
   mySensor.persistSettings(); // Uncomment this line to store the sensor settings in EEPROM
-
-  //Just for giggles, while the periodic measurements are stopped, let's read the sensor serial number
-  char serialNumber[13]; // The serial number is 48-bits. We need 12 bytes plus one extra to store it as ASCII Hex
-  if (mySensor.getSerialNumber(serialNumber) == true)
-  {
-    Serial.print(F("The sensor's serial number is: 0x"));
-    Serial.println(serialNumber);
-  }
 
   //Finally, we need to restart periodic measurements
   if (mySensor.startPeriodicMeasurement() == true)
@@ -148,6 +146,10 @@ void setup() {
   Serial.println("CCS811 ready.");
 
   setup_scd40();
+  sensor_gateway.add_sensor_id(SENSOR_READING_ID_CO2)
+  sensor_gateway.add_sensor_id(SENSOR_READING_ID_TVOC)
+  sensor_gateway.add_sensor_id(SENSOR_READING_ID_TEMPERATURE)
+  sensor_gateway.add_sensor_id(SENSOR_READING_ID_HUMIDITY)
 
   // Create reconnect timers
   mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000),
@@ -163,32 +165,25 @@ void setup() {
   mqttClient.onConnect(onMqttConnect);
   mqttClient.onDisconnect(onMqttDisconnect);
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.subscribe
 
   // Start WiFi
   connectToWifi();
 
-  // Get UUID
-  uuid = ESP.getEfuseMac();
-
-  // Print the value as a single decimal integer
-  Serial.print("Chip ID (Decimal): ");
-  Serial.println((uint64_t)chipId);
   pinMode(LED_PIN, OUTPUT);
 }
 
 void loop() {
   static unsigned long lastSensorTime = 0;
-  uint16_t co2_scd = 0,co2 = 0,tvoc = 0;
-  uint16_t rh_scd = 0;
-  int16_t temp_scd = 0;
+  SensorData sensor_data;
 
   if ((millis() - lastSensorTime) >= UPDATE_PERIOD) {
 
     if (ccs.available() && !ccs.readData()) {
 
       digitalWrite(LED_PIN, HIGH); 
-      co2  = ccs.geteCO2();
-      tvoc = ccs.getTVOC();
+      sensor_data.co2_ppm  = ccs.geteCO2();
+      sensor_data.tvoc = ccs.getTVOC();
 
     } else {
       Serial.println("Sensor not ready.");
@@ -197,8 +192,8 @@ void loop() {
     if (mySensor.readMeasurement()) // readMeasurement will return true when fresh data is available
     {
       co2_scd = mySensor.getCO2();
-      temp_scd = int16_t(mySensor.getTemperature()*10);
-      rh_scd = uint16_t(mySensor.getHumidity()*10);
+      sensor_data.temperature = int16_t(mySensor.getTemperature()*10);
+      sensor_data.humidity = uint16_t(mySensor.getHumidity()*10);
     }
 
 
@@ -208,9 +203,85 @@ void loop() {
       Serial.print("Publishing: ");
       Serial.println(payload);
 
-      mqttClient.publish(MQTT_TOPIC, 1, false, payload);
+      mqttClient.publish(MQTT_DATA_TOPIC, 1, false, payload);
 
     lastSensorTime = millis();
     digitalWrite(LED_PIN, LOW); 
   }
+}
+
+void send_mqtt_payload(char &payload,String topic){
+
+  mqttClient.publish(topic, 1, false, &global_array);
+}
+
+void sensor_device_data(SensorData &sensor_data){
+
+  // Format all struct elements directly into the string buffer
+  snprintf(global_array, MAX_BUFFER_SIZE, "%llu,%u,%u,%d,%u",
+           sensor_gateway.uuid, 
+           sensor_data.co2, 
+           sensor_data.tvoc,
+           sensor_data.temperature,
+           sensor_data.humidity);
+  send_mqtt_payload(global_array,MQTT_DATA_TOPIC);
+}
+
+void register_device(void){
+  // Use 'idx' to track the number of characters written so far.
+  int idx = snprintf(global_array, MAX_BUFFER_SIZE, "%llu,%u,%u,%u,%u", 
+                     sensor_gateway.uuid, FW_MAJOR, FW_MINOR, FW_PATCH, DEVICE_TYPE);
+  
+  // Check for snprintf errors (negative return value or index exceeding buffer size)
+  if (idx < 0 || idx >= MAX_BUFFER_SIZE) {
+    Serial.println("Error or buffer overflow during initial snprintf!");
+    return; 
+  }
+
+  // --- Step 2: Loop through the vector and append each element ---
+  for (size_t i = 0; i < sensor_gateway.size_of_sensor_ids(); ++i) {
+    // Append a comma, then the number. 
+    // We pass (global_array + idx) as the destination, and update idx with the return value.
+    int written = snprintf(global_array + idx, MAX_BUFFER_SIZE - idx, ",%u", sensor_readings);
+
+    // Check again for potential errors or buffer overflow during append
+    if (written < 0 || idx + written >= MAX_BUFFER_SIZE) {
+      Serial.println("Error or buffer overflow during vector append!");
+      // Optionally, break the loop if you can't fit more data
+      break; 
+    }
+    idx += written; // Update index for the next append operation
+  }
+
+  // The string is automatically null-terminated by the last snprintf call
+  Serial.print("Final Formatted String: ");
+  Serial.println(global_array);
+
+  send_mqtt_payload(global_array,MQTT_REGISTRATION_TOPIC);
+}
+
+void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
+    
+    String incomingTopic = String(topic);
+    // Extract the payload as a string for easier comparison
+    String incomingPayload = String(payload).substring(0, len); 
+
+    Serial.println("Message received on topic: " + incomingTopic);
+    Serial.println("Payload: " + incomingPayload);
+
+    // Filter 1: Check if it's the registration topic we care about
+    if (incomingTopic == MQTT_REGISTRATION_RESPONSE_TOPIC) {
+        
+        // Filter 2: Check if the payload is *specifically* acknowledging our ID
+        // The backend should reply with just the decimal uint64_t ID you sent
+        String expectedAck = String(sensor_gateway.uuid); 
+
+        if (incomingPayload == "ACK_" + expectedAck) {
+            sensor_gateway.registration = true;
+            Serial.println("REGISTRATION ACKNOWLEDGED for this device!");
+            // We stay subscribed to the topic in this scenario
+        } else if (incomingPayload.startsWith("NACK")) {
+             Serial.println("Registration NACK received. Check backend logic.");
+        }
+    }
 }

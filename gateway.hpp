@@ -3,6 +3,7 @@
 #include <array>
 #include "remote_station.hpp"
 #include "LoRaWan_APP.h"
+#include <vector>
 
 
 
@@ -31,42 +32,73 @@
 #define _ASYNC_MQTT_LOGLEVEL_               1
 #define WIFI_SSID         "Ziggo1459309"
 #define WIFI_PASSWORD     "dRez4aj2wcnf"
-#define MQTT_HOST         IPAddress(192, 168, 178, 181) //192.168.178.181
+#define MQTT_HOST         IPAddress(192, 168, 178, 127) //192.168.178.181
 #define MQTT_PORT         1883
+
+#define INVALID_INT16 0xFFFF
+
+#define MAX_NUM_OF_SENSORS 10
+
+#define SENSOR_READING_ID_TEMPERATURE 1
+#define SENSOR_READING_ID_HUMIDITY 2
+#define SENSOR_READING_ID_CO2 3
+#define SENSOR_READING_ID_TVOC 4
+#define SENSOR_READING_ID_PRESSURE 5
 
 class LoRa_GW{
   public:
 
     LoRa_GW(){
-      lora_idle = false;
-      rssi = 0;
-      rx_size = 0;
-      tx_number = 0;
+      this->rssi = 0;
+      this->battery_voltage = 0;
+      this->registered = false;
+
+      this->sensor_ids.reserve(MAX_NUM_OF_SENSORS);
+
+      // Get UUID
+      this->uuid = ESP.getEfuseMac();
+
+      // Print the value as a single decimal integer
+      Serial.print("Chip ID (Decimal): ");
+      Serial.println((uint64_t)chipId);
     };
 
-
-    // LORA
-    LoRa_RS* get_remote_station(int index);
-    static void OnRxDone( uint8_t *payload, uint16_t size, int16_t rx_rssi, int8_t rx_snr); // Declare the function here
-
-    void set_lora_idle(void);
-    void clear_lora_idle(void);
-    bool get_lora_idle(void);
-
-    // MQTT Func
-
     // Variables
-    int16_t tx_number;
-    int16_t rssi,rx_size;
-    static RadioEvents_t RadioEvents;
-    char txpacket[BUFFER_SIZE];
-    char rxpacket[BUFFER_SIZE];
+    int16_t rssi;
+    uint16_t battery_voltage;
+    uint64_t uuid;
+    bool registered;
+    
+    void add_sensor_id(int value)
+    {
+      if (sensor_count < MAX_NUM_OF_SENSORS){
+        sensor_ids.push_back(value);
+        sensor_count++;
+      }
+    }
+
+    int get_sensor_id(size_t index) const
+    {
+      return sensor_ids[index];
+    }
+
+    size_t size_of_sensor_ids() const
+    {
+      return sensor_ids.size();
+    }
 
   private:
-    static constexpr int number_of_remote_stations = 10;
-    std::array<LoRa_RS, number_of_remote_stations> remote_stations;
-    
-    bool lora_idle;
+    std::vector<int> sensor_ids;
+    uint16_t sensor_count = 0;
+
+};
+
+struct SensorData{
+  uint16_t humidity = INVALID_INT16;
+  int16_t temperature = INVALID_INT16;
+  uint16_t co2_ppm = INVALID_INT16;
+  uint16_t tvoc = INVALID_INT16;
+  uint16_t pressure = INVALID_INT16;
 
 };
 
