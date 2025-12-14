@@ -55,8 +55,6 @@ class LoRa_GW{
 
     // MQTT Func
 
-
-
     // Variables
     int16_t tx_number;
     int16_t rssi,rx_size;
